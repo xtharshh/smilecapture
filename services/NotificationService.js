@@ -2,32 +2,47 @@ import * as Notifications from 'expo-notifications';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
-const INTERVAL_STORAGE_KEY = 'smileReminderInterval';
+// --- Using specific identifiers for DND triggers ---
 const DND_START_ID = 'dnd-start-trigger';
 const DND_END_ID = 'dnd-end-trigger';
 
-// --- Global Listener for Notification Responses ---
-// This runs when a notification is received, even if the app is in the background.
+// --- Keys for AsyncStorage ---
+const INTERVAL_STORAGE_KEY = 'smileReminderInterval';
+const REMINDERS_ACTIVE_FLAG = 'remindersAreActive'; // IMPORTANT: Tracks user's intent
+
+// --- SIMPLIFIED LISTENER ---
+// This listener now ONLY handles DND triggers. It does NOT reschedule main reminders.
 Notifications.addNotificationReceivedListener(async (notification) => {
-  const { action } = notification.request.content.data;
-  console.log('Received notification in background/foreground with action:', action);
+  const action = notification.request.content.data?.action;
+
+  // If this isn't a DND notification, do nothing.
+  if (!action) {
+    return;
+  }
 
   if (action === 'dnd_start') {
-    // DND period is beginning, so we cancel the smile reminders.
-    await stopRepeatingNotifications();
-    console.log('[DND Manager] DND started. Reminders stopped.');
-  } else if (action === 'dnd_end') {
-    // DND period has ended. We need to restart the reminders.
-    const savedInterval = await AsyncStorage.getItem(INTERVAL_STORAGE_KEY);
-    if (savedInterval) {
-      await scheduleRepeatingNotifications(parseInt(savedInterval, 10));
-      console.log(`[DND Manager] DND ended. Reminders restarted for every ${savedInterval} minutes.`);
+    console.log('[Listener] DND start trigger received. Stopping all reminders for the night.');
+    // When DND starts, it simply cancels everything.
+    await Notifications.cancelAllScheduledNotificationsAsync();
+  } 
+  else if (action === 'dnd_end') {
+    console.log('[Listener] DND end trigger received. Checking if reminders should restart...');
+    // When DND ends, check if the user *wanted* them active.
+    const shouldBeActive = await AsyncStorage.getItem(REMINDERS_ACTIVE_FLAG);
+    if (shouldBeActive === 'true') {
+      const savedInterval = await AsyncStorage.getItem(INTERVAL_STORAGE_KEY);
+      if (savedInterval) {
+        const interval = parseInt(savedInterval, 10);
+        console.log(`[Listener] Reminders were active. Restarting for every ${interval} minutes.`);
+        // Call the main scheduling function to set up the repeating task again.
+        await scheduleRepeatingNotifications(interval);
+      }
+    } else {
+      console.log('[Listener] Reminders were not active, so they will not be restarted.');
     }
   }
 });
 
-
-// Configure how notifications are handled when the app is in the foreground.
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
     shouldShowBanner: true,
@@ -37,7 +52,6 @@ Notifications.setNotificationHandler({
   }),
 });
 
-// Request permissions and set up the Android notification channel.
 export async function initNotifications() {
   const { status } = await Notifications.requestPermissionsAsync();
   if (status !== 'granted') {
@@ -48,118 +62,100 @@ export async function initNotifications() {
     await Notifications.setNotificationChannelAsync('reminders', {
       name: 'Smile Reminders 😊',
       importance: Notifications.AndroidImportance.HIGH,
+      sound: 'default',
     });
   }
   return true;
 }
 
 /**
- * Schedules the main, visible repeating notifications.
+ * Schedules a TRUE repeating notification. This is called from the UI.
  * @param {number} intervalInMinutes The interval for reminders.
  */
 export async function scheduleRepeatingNotifications(intervalInMinutes) {
-  await stopRepeatingNotifications(); // Always clear before setting new ones
+  // Always clear previous tasks before starting a new one.
+  await Notifications.cancelAllScheduledNotificationsAsync();
 
   await Notifications.scheduleNotificationAsync({
     content: {
       title: "😊 Time to Smile!",
       body: "You look beautiful when you smile! Keep shining! 🌟",
+      sound: 'default',
     },
+    // Use a simple, reliable repeating trigger.
     trigger: {
       seconds: intervalInMinutes * 60,
       repeats: true,
+      channelId: 'reminders',
     },
   });
-  console.log(`Scheduled repeating smile reminders for every ${intervalInMinutes} minutes.`);
-  // Also save the interval so the DND manager can use it.
+  
+  // Set the flags to indicate that reminders are now ON.
+  await AsyncStorage.setItem(REMINDERS_ACTIVE_FLAG, 'true');
   await AsyncStorage.setItem(INTERVAL_STORAGE_KEY, String(intervalInMinutes));
+  console.log(`SUCCESS: Scheduled repeating reminders for every ${intervalInMinutes} minutes.`);
 }
 
 /**
- * Stops the main, visible repeating notifications.
+ * Stops ALL scheduled notifications. This is called from the UI.
  */
 export async function stopRepeatingNotifications() {
   await Notifications.cancelAllScheduledNotificationsAsync();
-  console.log('Cancelled all scheduled smile reminders.');
+  // Set the flag to indicate reminders are now OFF.
+  await AsyncStorage.setItem(REMINDERS_ACTIVE_FLAG, 'false');
+  console.log('SUCCESS: Stopped all scheduled notifications. Reminders are now INACTIVE.');
 }
 
 /**
- * Manages the DND schedule by setting silent, daily triggers.
- * @param {{hour: number, minute: number}} dndStart The DND start time.
- * @param {{hour: number, minute: number}} dndEnd The DND end time.
+ * Manages the DND schedule. It sets up its OWN triggers, separate from the main ones.
  */
 export async function manageDNDSchedule(dndStart, dndEnd) {
-  // Cancel any existing DND triggers before setting new ones.
+  // Always clear old DND triggers before setting new ones.
   await Notifications.cancelScheduledNotificationAsync(DND_START_ID);
   await Notifications.cancelScheduledNotificationAsync(DND_END_ID);
-  console.log('Cancelled previous DND triggers.');
 
-  // Schedule a silent trigger to STOP reminders when DND starts
+  // Schedule the trigger to STOP reminders
   await Notifications.scheduleNotificationAsync({
     identifier: DND_START_ID,
-    content: {
-      title: 'DND Manager', // Not visible to user
-      body: 'Stopping reminders for the night.', // Not visible to user
-      data: { action: 'dnd_start' },
-    },
-    trigger: {
-      hour: dndStart.hour,
-      minute: dndStart.minute,
-      repeats: true,
-    },
+    content: { data: { action: 'dnd_start' } },
+    trigger: { hour: dndStart.hour, minute: dndStart.minute, repeats: true, channelId: 'reminders' },
   });
-  console.log(`DND 'STOP' trigger set for ${dndStart.hour}:${dndStart.minute} daily.`);
 
-  // Schedule a silent trigger to START reminders when DND ends
+  // Schedule the trigger to potentially RESTART reminders
   await Notifications.scheduleNotificationAsync({
     identifier: DND_END_ID,
-    content: {
-      title: 'DND Manager', // Not visible
-      body: 'Restarting reminders for the day.', // Not visible
-      data: { action: 'dnd_end' },
-    },
-    trigger: {
-      hour: dndEnd.hour,
-      minute: dndEnd.minute,
-      repeats: true,
-    },
+    content: { data: { action: 'dnd_end' } },
+    trigger: { hour: dndEnd.hour, minute: dndEnd.minute, repeats: true, channelId: 'reminders' },
   });
-  console.log(`DND 'START' trigger set for ${dndEnd.hour}:${dndEnd.minute} daily.`);
+  
+  console.log(`SUCCESS: DND triggers set for ${dndStart.hour}:${dndStart.minute} (stop) and ${dndEnd.hour}:${dndEnd.minute} (start).`);
 }
 
 /**
- * Cancels the silent DND trigger notifications.
+ * Cancels only the DND trigger notifications.
  */
 export async function cancelDNDSchedule() {
   await Notifications.cancelScheduledNotificationAsync(DND_START_ID);
   await Notifications.cancelScheduledNotificationAsync(DND_END_ID);
-  console.log('Cancelled DND trigger notifications.');
+  console.log('SUCCESS: Cancelled DND trigger notifications.');
 }
 
-// --- Test Functions (remain unchanged) ---
+// --- Test Functions (Unchanged, they work fine) ---
 let testNotificationInterval = null;
-
 export async function startTestNotifications() {
   stopTestNotifications();
   await sendTestNotification();
-  testNotificationInterval = setInterval(async () => {
-    await sendTestNotification();
-  }, 5000);
+  testNotificationInterval = setInterval(sendTestNotification, 5000);
 }
-
 export function stopTestNotifications() {
   if (testNotificationInterval) {
     clearInterval(testNotificationInterval);
     testNotificationInterval = null;
   }
 }
-
 async function sendTestNotification() {
   await Notifications.scheduleNotificationAsync({
-    content: {
-      title: "🛠️ TEST: Smile Check",
-      body: "This is a test notification! 😊",
-    },
+    content: { title: "🛠️ TEST: Smile Check", body: "This is a test notification! 😊" },
     trigger: { seconds: 1 },
   });
 }
